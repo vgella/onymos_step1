@@ -1,9 +1,11 @@
 #include <atomic>
 #include <thread>
+#include <cstring>
+#include <cstdlib>
 
 struct Order {
     char type; // 'B' for Buy, 'S' for Sell
-    std::string ticker;
+    char ticker[6]; // Max 5 characters + null terminator
     int quantity;
     double price;
     std::atomic<Order*> next;
@@ -11,91 +13,112 @@ struct Order {
 
 class OrderBook {
 public:
-    std::atomic<Order*> buyHead;
-    std::atomic<Order*> sellHead;
+    std::atomic<Order*> buyHeads[1024]{};
+    std::atomic<Order*> sellHeads[1024]{};
+    char tickers[1024][6]{};
+    int tickerCount = 0;
     
-    OrderBook() : buyHead(nullptr), sellHead(nullptr) {}
-    
-    void addOrder(char type, const std::string& ticker, int quantity, double price) {
-        Order* newOrder = new Order{type, ticker, quantity, price, nullptr};
-        if (type == 'B') {
-            insertSortedBuy(newOrder);
-        } else {
-            insertSortedSell(newOrder);
+    int getTickerIndex(const char* ticker) {
+        for (int i = 0; i < tickerCount; ++i) {
+            if (strcmp(tickers[i], ticker) == 0) return i;
         }
-        matchOrders();
+        if (tickerCount < 1024) {
+            strncpy(tickers[tickerCount], ticker, 5);
+            tickers[tickerCount][5] = '\0'; // Ensure null termination
+            return tickerCount++;
+        }
+        return -1; // No space for new ticker
     }
     
-    void insertSortedBuy(Order* newOrder) {
-        Order* prev = nullptr;
-        Order* current = buyHead.load();
+    void addOrder(char type, const char* ticker, int quantity, double price) {
+        int index = getTickerIndex(ticker);
+        if (index == -1) return; // Ignore orders if max tickers reached
         
-        while (current && newOrder->price <= current->price) {
+        Order* newOrder = new Order; // Fix for atomic pointer assignment
+        newOrder->type = type;
+        newOrder->quantity = quantity;
+        newOrder->price = price;
+        newOrder->next = nullptr;
+        strncpy(newOrder->ticker, ticker, 5);
+        newOrder->ticker[5] = '\0';
+        
+        insertSortedOrder(newOrder, index, newOrder->type == 'B');
+    }
+    
+    void insertSortedOrder(Order* newOrder, int index, bool isBuy) {
+        Order* prev = nullptr;
+        Order* current = isBuy ? buyHeads[index].load() : sellHeads[index].load();
+        
+        while (current && ((isBuy && newOrder->price <= current->price) || (!isBuy && newOrder->price >= current->price))) {
             prev = current;
             current = current->next;
         }
         
         newOrder->next = current;
         if (prev) {
-            prev->next = newOrder;
+            prev->next.store(newOrder);
         } else {
-            buyHead.store(newOrder);
+            if (isBuy) {
+                buyHeads[index].store(newOrder);
+            } else {
+                sellHeads[index].store(newOrder);
+            }
         }
     }
     
-    void insertSortedSell(Order* newOrder) {
-        Order* prev = nullptr;
-        Order* current = sellHead.load();
-        
-        while (current && newOrder->price >= current->price) {
-            prev = current;
-            current = current->next;
-        }
-        
-        newOrder->next = current;
-        if (prev) {
-            prev->next = newOrder;
-        } else {
-            sellHead.store(newOrder);
-        }
-    }
-    
-    void matchOrders() {
-        Order* buy = buyHead.load();
-        Order* sell = sellHead.load();
-        
-        while (buy && sell && buy->price >= sell->price) {
-            int matchQty = std::min(buy->quantity, sell->quantity);
+    void matchOrder() {
+        for (int index = 0; index < tickerCount; ++index) {
+            Order* buy = buyHeads[index].load();
+            Order* prevSell = nullptr;
+            Order* sell = sellHeads[index].load();
             
-            buy->quantity -= matchQty;
-            sell->quantity -= matchQty;
-            
-            if (buy->quantity == 0) buy = buy->next;
-            if (sell->quantity == 0) sell = sell->next;
+            while (buy && sell) {
+                if (buy->price >= sell->price) {
+                    int matchQty;
+                    if (buy->quantity < sell->quantity) {
+                        matchQty = buy->quantity;
+                    } else {
+                        matchQty = sell->quantity;
+                    }
+                    buy->quantity -= matchQty;
+                    sell->quantity -= matchQty;
+                    
+                    if (sell->quantity == 0) {
+                        if (prevSell) {
+                            prevSell->next.store(sell->next); 
+                        } else {
+                            sellHeads[index].store(sell->next);
+                        }
+                        sell = sell->next;
+                    }
+                    if (buy->quantity == 0) buy = buy->next;
+                } else {
+                    break; 
+                }
+            }
         }
-        
-        buyHead.store(buy);
-        sellHead.store(sell);
     }
 };
 
-void simulateOrders(OrderBook &orderBook) {
-    for (int i = 0; i < 100; i++) {
+void simulateOrders(OrderBook &orderBook, int numEntries, double priceMin, double priceMax, const char* ticker) {
+    for (int i = 0; i < numEntries; i++) {
         int qty = rand() % 100 + 1;
-        double price = (rand() % 5000) / 100.0;
+        double price = priceMin + (rand() / (RAND_MAX / (priceMax - priceMin)));
         char type = (rand() % 2) ? 'B' : 'S';
-        orderBook.addOrder(type, "AAPL", qty, price);
+        orderBook.addOrder(type, ticker, qty, price);
     }
 }
 
 int main() {
     OrderBook orderBook;
     
-    std::thread t1(simulateOrders, std::ref(orderBook));
-    std::thread t2(simulateOrders, std::ref(orderBook));
+    std::thread t1(simulateOrders, std::ref(orderBook), 100, 110.0, 150.0, "AAPL");
+    std::thread t2(simulateOrders, std::ref(orderBook), 100, 180.0, 250.0, "GOOG");
     
     t1.join();
     t2.join();
+    
+    orderBook.matchOrder();
     
     return 0;
 }

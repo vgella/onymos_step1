@@ -2,11 +2,11 @@
 #include <thread>
 #include <cstring>
 #include <cstdlib>
-#include <iostream>
+
 
 struct Order {
-    char type; // 'B' for Buy, 'S' for Sell
-    char ticker[6]; // Max 5 characters + null terminator
+    char type; 
+    char ticker[6]; 
     int quantity;
     double price;
     std::atomic<Order*> next;

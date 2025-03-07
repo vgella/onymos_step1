@@ -2,6 +2,7 @@
 #include <thread>
 #include <cstring>
 #include <cstdlib>
+#include <iostream>
 
 struct Order {
     char type; // 'B' for Buy, 'S' for Sell
@@ -11,89 +12,89 @@ struct Order {
     std::atomic<Order*> next;
 };
 
+class PriorityQueue {
+public:
+    std::atomic<Order*> head;
+    
+    PriorityQueue() : head(nullptr) {}
+    
+    void insert(Order* newOrder, bool isBuy) {
+        Order* prevHead;
+        do {
+            prevHead = head.load(std::memory_order_acquire);
+            newOrder->next.store(prevHead, std::memory_order_relaxed);
+        } while (!head.compare_exchange_weak(prevHead, newOrder, std::memory_order_release, std::memory_order_relaxed));
+    }
+    
+    Order* pop() {
+        Order* prevHead;
+        Order* nextOrder;
+        do {
+            prevHead = head.load(std::memory_order_acquire);
+            if (!prevHead) return nullptr;
+            nextOrder = prevHead->next.load(std::memory_order_acquire);
+        } while (!head.compare_exchange_weak(prevHead, nextOrder, std::memory_order_release, std::memory_order_relaxed));
+        return prevHead;
+    }
+};
+
 class OrderBook {
 public:
-    std::atomic<Order*> buyHeads[1024]{};
-    std::atomic<Order*> sellHeads[1024]{};
+    PriorityQueue buyQueues[1024];
+    PriorityQueue sellQueues[1024];
     char tickers[1024][6]{};
-    int tickerCount = 0;
+    std::atomic<int> tickerCount{0};
     
     int getTickerIndex(const char* ticker) {
-        for (int i = 0; i < tickerCount; ++i) {
+        for (int i = 0; i < tickerCount.load(std::memory_order_acquire); ++i) {
             if (strcmp(tickers[i], ticker) == 0) return i;
         }
-        if (tickerCount < 1024) {
-            strncpy(tickers[tickerCount], ticker, 5);
-            tickers[tickerCount][5] = '\0'; // Ensure null termination
-            return tickerCount++;
+        if (tickerCount.load(std::memory_order_acquire) < 1024) {
+            int index = tickerCount.fetch_add(1, std::memory_order_acq_rel);
+            strncpy(tickers[index], ticker, 5);
+            tickers[index][5] = '\0';
+            return index;
         }
-        return -1; // No space for new ticker
+        return -1;
     }
     
     void addOrder(char type, const char* ticker, int quantity, double price) {
         int index = getTickerIndex(ticker);
-        if (index == -1) return; // Ignore orders if max tickers reached
+        if (index == -1) return;
         
-        Order* newOrder = new Order; // Fix for atomic pointer assignment
+        Order* newOrder = new Order;
         newOrder->type = type;
         newOrder->quantity = quantity;
         newOrder->price = price;
-        newOrder->next = nullptr;
+        newOrder->next.store(nullptr, std::memory_order_relaxed);
         strncpy(newOrder->ticker, ticker, 5);
         newOrder->ticker[5] = '\0';
         
-        insertSortedOrder(newOrder, index, newOrder->type == 'B');
-    }
-    
-    void insertSortedOrder(Order* newOrder, int index, bool isBuy) {
-        Order* prev = nullptr;
-        Order* current = isBuy ? buyHeads[index].load() : sellHeads[index].load();
-        
-        while (current && ((isBuy && newOrder->price <= current->price) || (!isBuy && newOrder->price >= current->price))) {
-            prev = current;
-            current = current->next;
-        }
-        
-        newOrder->next = current;
-        if (prev) {
-            prev->next.store(newOrder);
+        if (type == 'B') {
+            buyQueues[index].insert(newOrder, true);
         } else {
-            if (isBuy) {
-                buyHeads[index].store(newOrder);
-            } else {
-                sellHeads[index].store(newOrder);
-            }
+            sellQueues[index].insert(newOrder, false);
         }
     }
     
     void matchOrder() {
-        for (int index = 0; index < tickerCount; ++index) {
-            Order* buy = buyHeads[index].load();
-            Order* prevSell = nullptr;
-            Order* sell = sellHeads[index].load();
-            
-            while (buy && sell) {
+        for (int index = 0; index < tickerCount.load(std::memory_order_acquire); ++index) {
+            while (true) {
+                Order* buy = buyQueues[index].pop();
+                Order* sell = sellQueues[index].pop();
+                if (!buy || !sell) break;
+                
                 if (buy->price >= sell->price) {
-                    int matchQty;
-                    if (buy->quantity < sell->quantity) {
-                        matchQty = buy->quantity;
-                    } else {
-                        matchQty = sell->quantity;
-                    }
+                    int matchQty = (buy->quantity < sell->quantity) ? buy->quantity : sell->quantity;
                     buy->quantity -= matchQty;
                     sell->quantity -= matchQty;
                     
-                    if (sell->quantity == 0) {
-                        if (prevSell) {
-                            prevSell->next.store(sell->next); 
-                        } else {
-                            sellHeads[index].store(sell->next);
-                        }
-                        sell = sell->next;
-                    }
-                    if (buy->quantity == 0) buy = buy->next;
+                    if (buy->quantity > 0) buyQueues[index].insert(buy, true);
+                    if (sell->quantity > 0) sellQueues[index].insert(sell, false);
                 } else {
-                    break; 
+                    buyQueues[index].insert(buy, true);
+                    sellQueues[index].insert(sell, false);
+                    break;
                 }
             }
         }
@@ -122,4 +123,3 @@ int main() {
     
     return 0;
 }
-
